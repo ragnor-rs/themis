@@ -1,19 +1,23 @@
-import com.openai.client.OpenAIClient;
-import com.openai.client.okhttp.OpenAIOkHttpClient;
-import com.openai.models.ChatModel;
-import com.openai.models.chat.completions.*;
+import com.openai.client.okhttp.OpenAIOkHttpClient
+import com.openai.models.ChatModel
+import com.openai.models.chat.completions.*
+import com.openai.models.chat.completions.ChatCompletionContentPart.File.FileObject
+import java.io.File
+import java.io.FileInputStream
+import java.io.IOException
+import java.util.Base64
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.util.Base64;
-import java.util.List;
-
-public class ThemisBot {
-    public static void main(String[] args) throws Exception {
-        String prdBase64 = convertFileToBase64("assets/SMS messaging PRD at Fini.pdf");
-        String output = promptWithPdfBase64(prdBase64, "give a list of product features. plain text. one level list.\neach item must have a name and a detailed description.", "SMS messaging PRD at Fini.pdf");
-        System.out.println(output);
+object ThemisBot {
+    @Throws(Exception::class)
+    @JvmStatic
+    fun main(args: Array<String>) {
+        val prdBase64 = convertFileToBase64("assets/SMS messaging PRD at Fini.pdf")
+        val output = promptWithPdfBase64(
+            prdBase64,
+            "give a list of product features. plain text. one level list.\neach item must have a name and a detailed description.",
+            "SMS messaging PRD at Fini.pdf"
+        )
+        println(output)
     }
 
     /**
@@ -22,46 +26,47 @@ public class ThemisBot {
      * @return Base64 encoded string representation of the file
      * @throws IOException if file cannot be read
      */
-    public static String convertFileToBase64(String filePath) throws IOException {
-        File file = new File(filePath);
+    @Throws(IOException::class)
+    fun convertFileToBase64(filePath: String): String? {
+        val file = File(filePath)
 
         // Check if file exists
         if (!file.exists()) {
-            throw new IOException("File not found: " + filePath);
+            throw IOException("File not found: $filePath")
         }
 
         // Read file bytes
-        byte[] fileBytes = new byte[(int) file.length()];
-        try (FileInputStream fis = new FileInputStream(file)) {
-            //noinspection ResultOfMethodCallIgnored
-            fis.read(fileBytes);
+        val fileBytes = ByteArray(file.length().toInt())
+        FileInputStream(file).use { fis ->
+            fis.read(fileBytes)
         }
-
         // Convert to Base64
-        return Base64.getEncoder().encodeToString(fileBytes);
+        return Base64.getEncoder().encodeToString(fileBytes)
     }
 
-    public static String promptWithPdfBase64(String base64Content, String prompt, String filename) {
+    fun promptWithPdfBase64(base64Content: String?, prompt: String, filename: String): String {
         // Create PDF attachment with data URI
-        ChatCompletionContentPart.File.FileObject fileObject = ChatCompletionContentPart.File.FileObject.builder().fileData("data:application/pdf;base64," + base64Content).filename(filename).build();
-        ChatCompletionContentPart.File file = ChatCompletionContentPart.File.builder().file(fileObject).build();
-        ChatCompletionContentPart filePart = ChatCompletionContentPart.ofFile(file);
+        val fileObject: FileObject = FileObject.builder().fileData("data:application/pdf;base64,$base64Content").filename(filename).build()
+        val file: ChatCompletionContentPart.File = ChatCompletionContentPart.File.builder().file(fileObject).build()
+        val filePart = ChatCompletionContentPart.ofFile(file)
 
-        ChatCompletionContentPartText text = ChatCompletionContentPartText.builder().text(prompt).build();
-        ChatCompletionContentPart textPart = ChatCompletionContentPart.ofText(text);
+        val text = ChatCompletionContentPartText.builder().text(prompt).build()
+        val textPart = ChatCompletionContentPart.ofText(text)
 
         // Create user message with text prompt and PDF attachment
-        ChatCompletionMessageParam userMessage = ChatCompletionMessageParam.ofUser(ChatCompletionUserMessageParam.builder().contentOfArrayOfContentParts(List.of(filePart, textPart)).build());
+        val userMessage = ChatCompletionMessageParam.ofUser(
+            ChatCompletionUserMessageParam.builder().contentOfArrayOfContentParts(listOf(filePart, textPart)).build()
+        )
 
         // Create chat completion request
-        ChatCompletionCreateParams params = ChatCompletionCreateParams.builder()
-                .model(ChatModel.GPT_4O)
-                .messages(List.of(userMessage))
-                .build();
+        val params = ChatCompletionCreateParams.builder()
+            .model(ChatModel.Companion.GPT_4O)
+            .messages(listOf(userMessage))
+            .build()
 
-        OpenAIClient client = OpenAIOkHttpClient.fromEnv();
+        val client = OpenAIOkHttpClient.fromEnv()
 
-        ChatCompletion completion = client.chat().completions().create(params);
-        return completion.choices().getFirst().message().content().orElse("");
+        val completion = client.chat().completions().create(params)
+        return completion.choices()[0].message().content().orElse("")
     }
 }
