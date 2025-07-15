@@ -1,3 +1,9 @@
+import com.github.kotlintelegrambot.bot
+import com.github.kotlintelegrambot.dispatch
+import com.github.kotlintelegrambot.dispatcher.document
+import com.github.kotlintelegrambot.dispatcher.text
+import com.github.kotlintelegrambot.entities.ChatId
+import com.github.kotlintelegrambot.entities.TelegramFile
 import com.openai.client.okhttp.OpenAIOkHttpClient
 import com.openai.models.ChatModel
 import com.openai.models.chat.completions.*
@@ -11,18 +17,43 @@ import java.io.FileInputStream
 import java.io.IOException
 import java.util.*
 
-
 fun main() {
-    val prdBase64 = convertFileToBase64("assets/SMS messaging PRD at Fini.pdf")
-    val output = promptWithPdfBase64(
-        prdBase64,
-        "give a list of product features. plain text. one level list.\neach item must have a name and a detailed description.",
-        "SMS messaging PRD at Fini.pdf"
-    )
-    val items = toNonEmptyItems(output)
-    val results = queryVectorDb(items[0])
-    println(results[0].metadata.getFieldsOrThrow("description").stringValue)
+    val bot = bot {
+        token = System.getenv("TELEGRAM_BOT_TOKEN")
+        dispatch {
+            text {
+                bot.sendMessage(ChatId.fromId(message.chat.id), text = text)
+            }
+            document {
+                val prdFile = bot.downloadFileBytes(media.fileId)
+                val prdBase64 = convertByteArrayToBase64(prdFile!!)
+                val output = promptWithPdfBase64(
+                    prdBase64,
+                    "Give a list of product features. Plain text. One level list.\nEach item must have a name and a detailed description.",
+                    media.fileName!!
+                )
+                val items = toNonEmptyItems(output)
+                val results = queryVectorDb(items[0])
+                val description = results[0].metadata.getFieldsOrThrow("description").stringValue
+                bot.sendMessage(ChatId.fromId(message.chat.id), text = description)
+            }
+        }
+    }
+    bot.startPolling()
 }
+
+
+//fun main() {
+//    val prdBase64 = convertFileToBase64("assets/SMS messaging PRD at Fini.pdf")
+//    val output = promptWithPdfBase64(
+//        prdBase64,
+//        "give a list of product features. plain text. one level list.\neach item must have a name and a detailed description.",
+//        "SMS messaging PRD at Fini.pdf"
+//    )
+//    val items = toNonEmptyItems(output)
+//    val results = queryVectorDb(items[0])
+//    println(results[0].metadata.getFieldsOrThrow("description").stringValue)
+//}
 
 val client = OpenAIOkHttpClient.fromEnv()
 
@@ -48,8 +79,10 @@ fun convertFileToBase64(filePath: String): String? {
     }
 
     // Convert to Base64
-    return Base64.getEncoder().encodeToString(fileBytes)
+    return convertByteArrayToBase64(fileBytes)
 }
+
+private fun convertByteArrayToBase64(fileBytes: ByteArray): String? = Base64.getEncoder().encodeToString(fileBytes)
 
 fun promptWithPdfBase64(base64Content: String?, prompt: String, filename: String): String {
     // Create PDF attachment with data URI
