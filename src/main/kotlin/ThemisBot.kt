@@ -5,6 +5,7 @@ import com.github.kotlintelegrambot.dispatcher.document
 import com.github.kotlintelegrambot.dispatcher.text
 import com.github.kotlintelegrambot.entities.ChatId
 import com.github.kotlintelegrambot.entities.Message
+import com.github.kotlintelegrambot.entities.ParseMode
 import com.openai.client.okhttp.OpenAIOkHttpClient
 import com.openai.models.ChatModel
 import com.openai.models.chat.completions.*
@@ -17,6 +18,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.util.*
+import kotlin.collections.plus
 
 data class Clause(
     val chapterNumber: String,
@@ -59,12 +61,29 @@ data class UserState(
     val replies: List<Reply>,
     val clauseMap: Map<VectorDbIndex, List<Clause>>,
     val prdBase64: String,
+    val prdName: String,
 ) {
+    fun nextStep(): UserState {
+        return copy(step = step + 1)
+    }
+
+    fun addReply(text: String): UserState {
+        return copy(replies = replies + Reply(questions[step], text))
+    }
+
+    fun switchToQuestions(questions: List<Question>, prdBase64: String, clauseMap: Map<VectorDbIndex, List<Clause>>, prdName: String): UserState {
+        return copy(stage = UserStage.Questions, questions = questions, prdBase64 = prdBase64, clauseMap = clauseMap, prdName = prdName)
+    }
+
     companion object {
         fun createInitial(): UserState {
-            return UserState(UserStage.Initial, emptyList(), -1, emptyList(), emptyMap(), "")
+            return UserState(UserStage.Initial, emptyList(), -1, emptyList(), emptyMap(), "", "")
         }
     }
+}
+
+fun log(s: String) {
+    println(s)
 }
 
 fun main() {
@@ -72,31 +91,43 @@ fun main() {
 
     fun getUserState(message: Message): UserState = userStateMap.getOrPut(
         message.chat.id,
-        { UserState.createInitial() },
-    )
+    ) { UserState.createInitial() }
 
     fun summarize(message: Message, bot: Bot, state: UserState) {
         val summaryMap = mutableMapOf<VectorDbIndex, String>()
 
-        for (index in VectorDbIndex.entries) {
-            val indexSummary = generateIndexSummary(
-                state.prdBase64,
-                state.clauseMap,
-                state.replies,
-                index,
-            )
+        VectorDbIndex.entries.forEachIndexed { i, index ->
+            val indexReplies = state.replies.filter { it.question.index == index }
+            val clauses = state.clauseMap.getOrElse(index) { emptyList() }
+
+            // TODO embeddings
+
+            // TODO relevant clauses
+
+            log("6.${i+1}.3) summary - begin")
+            val prompt = buildGenerateSummaryPrompt(clauses, index, indexReplies)
+            val indexSummary = promptWithPdfBase64(state.prdBase64, prompt, state.prdName)
+            log("6.${i+1}.3) summary - end")
+
             summaryMap.put(index, indexSummary)
         }
 
-        val finalSummary = unifySummaries(summaryMap)
+        log("7) join summaries - begin")
+        val prompt = buildJoinSummariesPrompt(summaryMap)
+        val finalSummary = promptWithPdfBase64(null, prompt, null)
+        log("7) join summaries - end")
 
-        bot.sendMessage(ChatId.fromId(message.chat.id), text = finalSummary)
+        bot.sendMessage(ChatId.fromId(message.chat.id), text = finalSummary, parseMode = ParseMode.HTML)
     }
 
     fun askNextQuestion(message: Message, bot: Bot) {
         val state = getUserState(message)
-        val nextState = state.copy(state.stage, state.questions, state.step + 1)
-        if (nextState.questions.size >= nextState.step) {
+        if (state.step == -1) {
+            log("5) additional data - begin")
+        }
+        val nextState = state.nextStep()
+        if (nextState.questions.size <= nextState.step) {
+            log("5) additional data - end")
             summarize(message, bot, nextState)
             userStateMap.put(message.chat.id, UserState.createInitial())
         } else {
@@ -112,13 +143,7 @@ fun main() {
                 val state = getUserState(message)
 
                 if (state.stage == UserStage.Questions) {
-                    // 6) additional data
-                    val nextState = state.copy(
-                        state.stage,
-                        state.questions,
-                        state.step,
-                        state.replies + Reply(state.questions[state.step], message.text!!),
-                    )
+                    val nextState = state.addReply(message.text!!)
                     userStateMap.put(message.chat.id, nextState)
 
                     askNextQuestion(message, bot)
@@ -129,27 +154,31 @@ fun main() {
 
                 if (state.stage == UserStage.Initial) {
 
-                    // 1) PRD doc
+                    log("1) PRD doc - begin")
                     val prdFile = bot.downloadFileBytes(media.fileId)
                     val prdBase64 = convertByteArrayToBase64(prdFile!!)
+                    log("1) PRD doc - end")
 
-                    // 2) product features
+                    log("2) product features - begin")
                     val output = promptWithPdfBase64(
                         prdBase64,
                         "Give a list of product features. Plain text. One level list.\nEach item must have a name and a detailed description.",
                         media.fileName!!
                     )
                     val items = toNonEmptyItems(output)
+                    log("2) product features - end")
 
                     val questions = mutableListOf<Question>()
+                    val clauseMap = mutableMapOf<VectorDbIndex, List<Clause>>()
 
-                    for (index in VectorDbIndex.entries) {
+                    VectorDbIndex.entries.forEachIndexed { i, index ->
                         val clauses = mutableListOf<Clause>()
-                        for (productFeature in items) {
-                            // 3) embeddings
+                        items.forEachIndexed { j, productFeature ->
+                            log("3.${i+1}.${j+1}.1) embeddings - begin")
                             val results = queryVectorDb(productFeature, index.indexName)
+                            log("3.${i+1}.${j+1}.1) embeddings - end")
 
-                            // 4) relevant clauses
+                            log("3.${i+1}.${j+1}.2) relevant clauses - begin")
                             for (result in results) {
                                 result.metadata.let {
                                     val clause = Clause(
@@ -165,14 +194,21 @@ fun main() {
                                     clauses.add(clause)
                                 }
                             }
+                            log("3.${i+1}.${j+1}.2) relevant clauses - end")
 
-                            // 5) questions
+                            log("3.${i+1}.${j+1}.3) question gen - begin")
                             val indexQuestions = generateQuestions(prdBase64, clauses).map { Question(it, index) }
                             questions.addAll(indexQuestions)
+                            log("3.${i+1}.${j+1}.3) question gen - end")
                         }
+                        clauseMap.put(index, clauses)
                     }
 
-                    userStateMap.put(message.chat.id, state.copy(UserStage.Questions, questions))
+                    log("4) filter questions - begin")
+                    val filteredQuestions = filterQuestions(prdBase64, questions)
+                    log("4) filter questions - end")
+
+                    userStateMap.put(message.chat.id, state.switchToQuestions(filteredQuestions, prdBase64, clauseMap, media.fileName!!))
 
                     askNextQuestion(message, bot)
                 }
@@ -188,24 +224,75 @@ fun generateQuestions(
     prdBase64: String,
     clauses: List<Clause>
 ): List<String> {
-    return listOf("What's up?")
+    return emptyList() //listOf("What's up?")
 }
 
-// TODO generateIndexSummary
-fun generateIndexSummary(
+// TODO filterQuestions
+fun filterQuestions(
     prdBase64: String,
-    clauseMap: Map<VectorDbIndex, List<Clause>>,
-    replies: List<Reply>,
-    index: VectorDbIndex,
-): String {
-    val indexReplies = replies.filter { it.question.index == index }
-    val clauses = clauseMap.getOrElse(index, { emptyList() })
-    return "No summary for ${index.description}"
+    questions: List<Question>
+): List<Question> {
+    return questions
 }
 
-// TODO unifySummaries
-fun unifySummaries(summaryMap: MutableMap<VectorDbIndex, String>): String {
-    return "No summary, sorry!"
+private fun buildGenerateSummaryPrompt(
+    clauses: List<Clause>,
+    index: VectorDbIndex,
+    indexReplies: List<Reply>
+): String {
+    val promptBuilder = StringBuilder()
+
+    promptBuilder.appendLine("This is a product requirements description file. Evaluate if it meets legal requirements specified by the list of relevant clauses below.")
+
+    if (clauses.isNotEmpty()) {
+        promptBuilder.appendLine()
+        promptBuilder.appendLine()
+        promptBuilder.appendLine("--- Start of relevant clauses ---")
+        for (clause in clauses) {
+            promptBuilder.appendLine("From ${index.description}")
+            promptBuilder.appendLine("Chapter ${clause.chapterNumber}. ${clause.chapterTitle}")
+            promptBuilder.appendLine("Section ${clause.sectionNumber}. ${clause.sectionTitle}")
+            promptBuilder.appendLine("Article ${clause.articleNumber}. ${clause.articleTitle}")
+            promptBuilder.appendLine(clause.description)
+            promptBuilder.appendLine()
+        }
+        promptBuilder.appendLine("--- End of relevant clauses ---")
+    }
+
+    if (indexReplies.isNotEmpty()) {
+        promptBuilder.appendLine()
+        promptBuilder.appendLine()
+        promptBuilder.appendLine("--- Start of Q&A about the product ---")
+        for (reply in indexReplies) {
+            promptBuilder.appendLine(reply.question.question)
+            promptBuilder.appendLine(reply.reply)
+            promptBuilder.appendLine()
+        }
+        promptBuilder.appendLine("--- End of Q&A about the product ---")
+    }
+
+    val prompt = promptBuilder.toString()
+    return prompt
+}
+
+private fun buildJoinSummariesPrompt(summaryMap: MutableMap<VectorDbIndex, String>): String {
+    val promptBuilder = StringBuilder()
+
+    promptBuilder.appendLine("Unify the following reports into one.")
+
+    if (summaryMap.isNotEmpty()) {
+        promptBuilder.appendLine()
+        promptBuilder.appendLine()
+        for (e in summaryMap.entries) {
+            promptBuilder.appendLine("--- Start of legal compliance report for ${e.key.description} ---")
+            promptBuilder.appendLine(e.value)
+            promptBuilder.appendLine("--- End of legal compliance report for ${e.key.description} ---")
+            promptBuilder.appendLine()
+        }
+    }
+
+    val prompt = promptBuilder.toString()
+    return prompt
 }
 
 val client = OpenAIOkHttpClient.fromEnv()
@@ -237,19 +324,24 @@ fun convertFileToBase64(filePath: String): String? {
 
 private fun convertByteArrayToBase64(fileBytes: ByteArray): String = Base64.getEncoder().encodeToString(fileBytes)
 
-fun promptWithPdfBase64(base64Content: String?, prompt: String, filename: String): String {
-    // Create PDF attachment with data URI
-    val fileObject: FileObject =
-        FileObject.builder().fileData("data:application/pdf;base64,$base64Content").filename(filename).build()
-    val file: ChatCompletionContentPart.File = ChatCompletionContentPart.File.builder().file(fileObject).build()
-    val filePart = ChatCompletionContentPart.ofFile(file)
+fun promptWithPdfBase64(base64Content: String?, prompt: String, filename: String?): String {
+    val parts = mutableListOf<ChatCompletionContentPart>()
+
+    if (base64Content != null) {
+        val fileObject: FileObject =
+            FileObject.builder().fileData("data:application/pdf;base64,$base64Content").filename(filename!!).build()
+        val file: ChatCompletionContentPart.File = ChatCompletionContentPart.File.builder().file(fileObject).build()
+        val filePart = ChatCompletionContentPart.ofFile(file)
+        parts.add(filePart)
+    }
 
     val text = ChatCompletionContentPartText.builder().text(prompt).build()
     val textPart = ChatCompletionContentPart.ofText(text)
+    parts.add(textPart)
 
     // Create user message with text prompt and PDF attachment
     val userMessage = ChatCompletionMessageParam.ofUser(
-        ChatCompletionUserMessageParam.builder().contentOfArrayOfContentParts(listOf(filePart, textPart)).build()
+        ChatCompletionUserMessageParam.builder().contentOfArrayOfContentParts(parts).build()
     )
 
     // Create chat completion request
