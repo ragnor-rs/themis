@@ -5,7 +5,6 @@ import com.github.kotlintelegrambot.dispatcher.document
 import com.github.kotlintelegrambot.dispatcher.text
 import com.github.kotlintelegrambot.entities.ChatId
 import com.github.kotlintelegrambot.entities.Message
-import com.github.kotlintelegrambot.entities.ParseMode
 import com.openai.client.okhttp.OpenAIOkHttpClient
 import com.openai.models.ChatModel
 import com.openai.models.chat.completions.*
@@ -117,7 +116,7 @@ fun main() {
         val finalSummary = promptWithPdfBase64(null, prompt, null)
         log("7) join summaries - end")
 
-        bot.sendMessage(ChatId.fromId(message.chat.id), text = finalSummary, parseMode = ParseMode.HTML)
+        bot.sendMessage(ChatId.fromId(message.chat.id), text = finalSummary)
     }
 
     fun askNextQuestion(message: Message, bot: Bot) {
