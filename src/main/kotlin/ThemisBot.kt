@@ -5,6 +5,7 @@ import com.github.kotlintelegrambot.dispatcher.document
 import com.github.kotlintelegrambot.dispatcher.text
 import com.github.kotlintelegrambot.entities.ChatId
 import com.github.kotlintelegrambot.entities.Message
+import com.github.kotlintelegrambot.entities.TelegramFile
 import com.openai.client.okhttp.OpenAIOkHttpClient
 import com.openai.models.ChatModel
 import com.openai.models.chat.completions.*
@@ -13,11 +14,13 @@ import com.openai.models.embeddings.EmbeddingCreateParams
 import com.openai.models.embeddings.EmbeddingModel
 import io.pinecone.clients.Pinecone
 import io.pinecone.unsigned_indices_model.ScoredVectorWithUnsignedIndices
+import org.intellij.markdown.flavours.commonmark.CommonMarkFlavourDescriptor
+import org.intellij.markdown.html.HtmlGenerator
+import org.intellij.markdown.parser.MarkdownParser
 import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.util.*
-import kotlin.collections.plus
 
 data class Clause(
     val chapterNumber: String,
@@ -116,7 +119,11 @@ fun main() {
         val finalSummary = promptWithPdfBase64(null, prompt, null)
         log("7) join summaries - end")
 
-        bot.sendMessage(ChatId.fromId(message.chat.id), text = finalSummary)
+        val flavour = CommonMarkFlavourDescriptor()
+        val parsedTree = MarkdownParser(flavour).buildMarkdownTreeFromString(finalSummary)
+        val html = HtmlGenerator(finalSummary, parsedTree, flavour).generateHtml()
+        val file = TelegramFile.ByByteArray(html.toByteArray(), "report.html")
+        bot.sendDocument(ChatId.fromId(message.chat.id), file)
     }
 
     fun askNextQuestion(message: Message, bot: Bot) {
@@ -152,7 +159,6 @@ fun main() {
                 val state = getUserState(message)
 
                 if (state.stage == UserStage.Initial) {
-
                     log("1) PRD doc - begin")
                     val prdFile = bot.downloadFileBytes(media.fileId)
                     val prdBase64 = convertByteArrayToBase64(prdFile!!)
@@ -196,7 +202,7 @@ fun main() {
                             log("3.${i+1}.${j+1}.2) relevant clauses - end")
 
                             log("3.${i+1}.${j+1}.3) question gen - begin")
-                            val indexQuestions = generateQuestions(prdBase64, clauses).map { Question(it, index) }
+                            val indexQuestions = generateQuestions(prdBase64, clauses, media.fileName!!, index).map { Question(it, index) }
                             questions.addAll(indexQuestions)
                             log("3.${i+1}.${j+1}.3) question gen - end")
                         }
@@ -218,13 +224,49 @@ fun main() {
     bot.startPolling()
 }
 
-// TODO generateQuestions
 fun generateQuestions(
     prdBase64: String,
-    clauses: List<Clause>
+    clauses: List<Clause>,
+    filename: String,
+    index: VectorDbIndex,
 ): List<String> {
-    return emptyList() //listOf("What's up?")
+    val prompt = buildGenerateQuestionsPrompt(clauses, index)
+    val output = promptWithPdfBase64(
+        prdBase64,
+        prompt,
+        filename,
+    )
+    val items = toNonEmptyItems(output)
+    return items
 }
+
+private fun buildGenerateQuestionsPrompt(
+    clauses: List<Clause>,
+    index: VectorDbIndex,
+): String {
+    val promptBuilder = StringBuilder()
+
+    promptBuilder.appendLine("Generate a list of questions to gather data missing from the provided product specification. Questions will be used to assess compliance with the clauses below, Plain text. One level list.\nA question per line.")
+
+    if (clauses.isNotEmpty()) {
+        promptBuilder.appendLine()
+        promptBuilder.appendLine()
+        promptBuilder.appendLine("--- Start of relevant clauses ---")
+        for (clause in clauses) {
+            promptBuilder.appendLine("From ${index.description}")
+            promptBuilder.appendLine("Chapter ${clause.chapterNumber}. ${clause.chapterTitle}")
+            promptBuilder.appendLine("Section ${clause.sectionNumber}. ${clause.sectionTitle}")
+            promptBuilder.appendLine("Article ${clause.articleNumber}. ${clause.articleTitle}")
+            promptBuilder.appendLine(clause.description)
+            promptBuilder.appendLine()
+        }
+        promptBuilder.appendLine("--- End of relevant clauses ---")
+    }
+
+    val prompt = promptBuilder.toString()
+    return prompt
+}
+
 
 // TODO filterQuestions
 fun filterQuestions(
