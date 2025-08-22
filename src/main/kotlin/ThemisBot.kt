@@ -216,7 +216,7 @@ fun main() {
                     }
 
                     log("4) filter questions - begin")
-                    val filteredQuestions = filterQuestions(prdBase64, questions)
+                    val filteredQuestions = filterQuestions(prdBase64, questions, media.fileName!!)
                     log("4) filter questions - end: removed ${questions.size - filteredQuestions.size} questions")
 
                     userStateMap.put(message.chat.id, state.switchToQuestions(filteredQuestions, prdBase64, clauseMap, media.fileName!!))
@@ -252,7 +252,7 @@ private fun buildGenerateQuestionsPrompt(
 ): String {
     val promptBuilder = StringBuilder()
 
-    promptBuilder.appendLine("Generate a list of questions to gather data missing from the provided product specification. Questions will be used to assess compliance with the clauses below, Plain text. One level list.\nA question per line.")
+    promptBuilder.appendLine("Generate questions to gather data missing from the provided product specification. Questions will be used to assess compliance with the clauses below. Always mention the name of law along with an article number. Plain text. One level list. Don't use bullets. Don't start with question index. One question per line.")
 
     if (clauses.isNotEmpty()) {
         promptBuilder.appendLine()
@@ -273,13 +273,39 @@ private fun buildGenerateQuestionsPrompt(
     return prompt
 }
 
-
-// TODO filterQuestions
 fun filterQuestions(
     prdBase64: String,
-    questions: List<Question>
+    questions: List<Question>,
+    filename: String,
 ): List<Question> {
-    return questions
+    val prompt = buildFilterQuestionsPrompt(questions)
+    val output = promptWithPdfBase64(
+        prdBase64,
+        prompt,
+        filename,
+    )
+    val items = toNonEmptyItems(output)
+    return questions.filterIndexed { i, q -> items.contains(i.toString()) }
+}
+
+private fun buildFilterQuestionsPrompt(
+    questions: List<Question>,
+): String {
+    val promptBuilder = StringBuilder()
+
+    promptBuilder.appendLine("Here's a numbered list of questions to gather data missing from the provided product specification. Remove questions that are not relevant. Drop a question if it's about what's contained in the product specification. Filter out questions which can be answered after studying the product specification. Print just indices of the questions left. Plain text. One level list.\nAn index number per line.")
+
+    if (questions.isNotEmpty()) {
+        promptBuilder.appendLine()
+        promptBuilder.appendLine()
+        questions.forEachIndexed { i, q ->
+            promptBuilder.appendLine(i.toString() + ") " + q.question)
+            promptBuilder.appendLine()
+        }
+    }
+
+    val prompt = promptBuilder.toString()
+    return prompt
 }
 
 private fun buildGenerateSummaryPrompt(
