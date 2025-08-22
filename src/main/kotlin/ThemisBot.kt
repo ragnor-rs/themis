@@ -20,6 +20,7 @@ import org.intellij.markdown.parser.MarkdownParser
 import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
+import java.text.SimpleDateFormat
 import java.util.*
 
 data class Clause(
@@ -84,11 +85,15 @@ data class UserState(
     }
 }
 
+val logDateFormatter = SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+
 fun log(s: String) {
-    println(s)
+    println(logDateFormatter.format(Date()) + " - " + s)
 }
 
 fun main() {
+    log("Bot started")
+
     val userStateMap = mutableMapOf<Long, UserState>()
 
     fun getUserState(message: Message): UserState = userStateMap.getOrPut(
@@ -171,7 +176,7 @@ fun main() {
                         media.fileName!!
                     )
                     val items = toNonEmptyItems(output)
-                    log("2) product features - end")
+                    log("2) product features - end: extracted ${items.size} features")
 
                     val questions = mutableListOf<Question>()
                     val clauseMap = mutableMapOf<VectorDbIndex, List<Clause>>()
@@ -180,10 +185,11 @@ fun main() {
                         val clauses = mutableListOf<Clause>()
                         items.forEachIndexed { j, productFeature ->
                             log("3.${i+1}.${j+1}.1) embeddings - begin")
-                            val results = queryVectorDb(productFeature, index.indexName)
+                            val embeddings = generateEmbeddings(productFeature)
                             log("3.${i+1}.${j+1}.1) embeddings - end")
 
                             log("3.${i+1}.${j+1}.2) relevant clauses - begin")
+                            val results = queryVectorDb(embeddings, index.indexName)
                             for (result in results) {
                                 result.metadata.let {
                                     val clause = Clause(
@@ -199,19 +205,19 @@ fun main() {
                                     clauses.add(clause)
                                 }
                             }
-                            log("3.${i+1}.${j+1}.2) relevant clauses - end")
+                            log("3.${i+1}.${j+1}.2) relevant clauses - end: fetched ${results.size} clauses")
 
                             log("3.${i+1}.${j+1}.3) question gen - begin")
                             val indexQuestions = generateQuestions(prdBase64, clauses, media.fileName!!, index).map { Question(it, index) }
                             questions.addAll(indexQuestions)
-                            log("3.${i+1}.${j+1}.3) question gen - end")
+                            log("3.${i+1}.${j+1}.3) question gen - end: generated ${indexQuestions.size} questions")
                         }
                         clauseMap.put(index, clauses)
                     }
 
                     log("4) filter questions - begin")
                     val filteredQuestions = filterQuestions(prdBase64, questions)
-                    log("4) filter questions - end")
+                    log("4) filter questions - end: removed ${questions.size - filteredQuestions.size} questions")
 
                     userStateMap.put(message.chat.id, state.switchToQuestions(filteredQuestions, prdBase64, clauseMap, media.fileName!!))
 
@@ -319,7 +325,7 @@ private fun buildGenerateSummaryPrompt(
 private fun buildJoinSummariesPrompt(summaryMap: MutableMap<VectorDbIndex, String>): String {
     val promptBuilder = StringBuilder()
 
-    promptBuilder.appendLine("Unify the following reports into one.")
+    promptBuilder.appendLine("Merge the following reports into one.")
 
     if (summaryMap.isNotEmpty()) {
         promptBuilder.appendLine()
@@ -408,8 +414,7 @@ fun generateEmbeddings(text: String): List<Float> {
     return client.embeddings().create(createParams).data()[0].embedding()
 }
 
-fun queryVectorDb(text: String, indexName: String): List<ScoredVectorWithUnsignedIndices> {
-    val embeddings = generateEmbeddings(text)
+fun queryVectorDb(embeddings: List<Float>, indexName: String): List<ScoredVectorWithUnsignedIndices> {
     val pinecone = Pinecone.Builder(System.getenv("PINECONE_API_KEY")).build()
     val index = pinecone.getIndexConnection(indexName)
     val response = index.queryByVector(5, embeddings, true, true)
