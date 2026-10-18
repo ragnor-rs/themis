@@ -37,4 +37,8 @@ bin/
 
 ### Mac OS ###
 .DS_Store
-/.env
+
+### Secrets ###
+.env
+.env.*
+!.env.example

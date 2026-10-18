@@ -1,10 +1,15 @@
 plugins {
     id("java")
+    id("application")
     kotlin("jvm")
 }
 
-group = "org.example"
-version = "1.0-SNAPSHOT"
+group = "io.github.ragnorrs.themis"
+version = "0.1.0"
+
+application {
+    mainClass = "ThemisBotKt"
+}
 
 repositories {
     mavenCentral()
