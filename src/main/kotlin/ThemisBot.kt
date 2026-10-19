@@ -22,6 +22,7 @@ import java.io.FileInputStream
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.system.exitProcess
 
 data class Clause(
     val chapterNumber: String,
@@ -43,8 +44,8 @@ enum class VectorDbIndex(
     val indexName: String,
     val description: String,
 ) {
-    Dsa(System.getenv("PINECONE_INDEX_DSA_NAME"), "EU Digital Services Act"),
-    Gdpr(System.getenv("PINECONE_INDEX_GDPR_NAME"), "EU General Data Protection Regulation"),
+    Dsa(requireEnv("PINECONE_INDEX_DSA_NAME"), "EU Digital Services Act"),
+    Gdpr(requireEnv("PINECONE_INDEX_GDPR_NAME"), "EU General Data Protection Regulation"),
 }
 
 data class Question(
@@ -91,7 +92,32 @@ fun log(s: String) {
     println(logDateFormatter.format(Date()) + " - " + s)
 }
 
+val requiredEnvVars = listOf(
+    "TELEGRAM_BOT_TOKEN",
+    "OPENAI_API_KEY",
+    "PINECONE_API_KEY",
+    "PINECONE_INDEX_DSA_NAME",
+    "PINECONE_INDEX_GDPR_NAME",
+)
+
+fun requireEnv(name: String): String =
+    System.getenv(name) ?: error("Missing required environment variable: $name")
+
+/** Reports every missing variable at once, so a misconfigured run does not need five restarts to fix. */
+private fun checkRequiredEnvVars() {
+    val missing = requiredEnvVars.filter { System.getenv(it).isNullOrBlank() }
+    if (missing.isEmpty()) {
+        return
+    }
+    System.err.println("Missing required environment variable(s): " + missing.joinToString(", "))
+    System.err.println("Copy .env.example to .env, fill it in, then: set -a && . ./.env && set +a")
+    System.err.println("See the Configuration section of README.md.")
+    exitProcess(1)
+}
+
 fun main() {
+    checkRequiredEnvVars()
+
     log("Bot started")
 
     val userStateMap = mutableMapOf<Long, UserState>()
@@ -148,7 +174,7 @@ fun main() {
     }
 
     val bot = bot {
-        token = System.getenv("TELEGRAM_BOT_TOKEN")
+        token = requireEnv("TELEGRAM_BOT_TOKEN")
         dispatch {
             text {
                 val state = getUserState(message)
@@ -368,7 +394,8 @@ private fun buildJoinSummariesPrompt(summaryMap: MutableMap<VectorDbIndex, Strin
     return prompt
 }
 
-val client = OpenAIOkHttpClient.fromEnv()
+// Lazy so that checkRequiredEnvVars() reports a missing OPENAI_API_KEY before the SDK does.
+val client by lazy { OpenAIOkHttpClient.fromEnv() }
 
 /**
  * Converts a file to Base64 string
@@ -441,7 +468,7 @@ fun generateEmbeddings(text: String): List<Float> {
 }
 
 fun queryVectorDb(embeddings: List<Float>, indexName: String): List<ScoredVectorWithUnsignedIndices> {
-    val pinecone = Pinecone.Builder(System.getenv("PINECONE_API_KEY")).build()
+    val pinecone = Pinecone.Builder(requireEnv("PINECONE_API_KEY")).build()
     val index = pinecone.getIndexConnection(indexName)
     val response = index.queryByVector(5, embeddings, true, true)
     return response.matchesList
