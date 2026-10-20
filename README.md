@@ -8,7 +8,7 @@ A Telegram bot that reviews a product requirements document against EU regulatio
 
 1. You send a PDF to the bot.
 2. It asks GPT-4o for the list of product features in the document.
-3. For each feature, it creates an embedding and queries two Pinecone indexes — one for the DSA, one for the GDPR — for the five most relevant clauses.
+3. For each feature, it creates an embedding and queries two Pinecone indexes — one for the DSA, one for the GDPR — for the five most relevant clauses. Those indexes are built by `./gradlew ingest`, described below.
 4. From those clauses it generates questions covering what the document does not say, then drops the ones already answered by the document.
 5. It asks you the remaining questions one at a time in the chat.
 6. It writes a compliance assessment per regulation, merges them into one report, and sends it back as `report.html`.
@@ -17,32 +17,12 @@ State is held in memory per chat, so a restart loses in-progress conversations.
 
 ## Requirements
 
-- JDK 21
+- JDK 21 — the Gradle build downloads one if your default JDK is older
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - An OpenAI API key
-- A Pinecone API key, plus two populated indexes (see below)
+- A Pinecone API key
 
-## Pinecone index contract
-
-The bot only reads from Pinecone — it does not populate it. **You need to build the two indexes yourself before the bot will work.** Each must be created with:
-
-- **Dimension 3072**, to match OpenAI `text-embedding-3-large`
-- Metric: cosine
-
-Every vector is one clause of the regulation, embedded from its text, and must carry all eight of these string metadata fields. A missing field is a hard error, not a skipped clause:
-
-| Field | Example |
-| --- | --- |
-| `chapter_number` | `III` |
-| `chapter_title` | `Due diligence obligations for a transparent and safe online environment` |
-| `section_number` | `1` |
-| `section_title` | `Provisions applicable to all providers of intermediary services` |
-| `article_number` | `11` |
-| `article_title` | `Points of contact for recipients of the service` |
-| `clause_number` | `1` |
-| `description` | The clause text itself. |
-
-Point `PINECONE_INDEX_DSA_NAME` and `PINECONE_INDEX_GDPR_NAME` at the resulting indexes.
+Nothing needs to exist in Pinecone beforehand; `./gradlew ingest` creates and fills the indexes.
 
 ## Configuration
 
@@ -59,8 +39,49 @@ set -a && . ./.env && set +a
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `OPENAI_API_KEY` | OpenAI API key |
 | `PINECONE_API_KEY` | Pinecone API key |
-| `PINECONE_INDEX_DSA_NAME` | Index holding DSA clauses |
-| `PINECONE_INDEX_GDPR_NAME` | Index holding GDPR clauses |
+| `PINECONE_INDEX_DSA_NAME` | Index to hold the DSA clauses. Created if missing. |
+| `PINECONE_INDEX_GDPR_NAME` | Index to hold the GDPR clauses. Created if missing. |
+| `PINECONE_CLOUD` | Optional. Serverless cloud, `aws` by default. |
+| `PINECONE_REGION` | Optional. Serverless region, `us-east-1` by default. |
+
+## Loading the regulations
+
+The bot only reads from Pinecone, so the indexes have to be filled once before it can answer anything:
+
+```sh
+./gradlew ingest
+```
+
+For each regulation this downloads the English text from the EU Publications Office, splits it into clauses, creates the index if it does not already exist, then embeds and upserts every clause. It takes a few minutes and costs a few cents in embeddings — about 1,100 clauses and 210,000 tokens in total.
+
+To check the parser without spending anything, or without any credentials at all:
+
+```sh
+./gradlew ingest --args="--dry-run"
+```
+
+That downloads and parses the two documents, prints what it found and a sample clause of each shape, and stops before calling OpenAI or Pinecone.
+
+Re-running is safe. A vector's id comes from the clause's position in the regulation, so a second run overwrites the same clauses instead of duplicating them, and an interrupted run can simply be repeated.
+
+### What ends up in the index
+
+One vector per clause, embedded from its headings plus its text, at **dimension 3072** (OpenAI `text-embedding-3-large`) with the **cosine** metric. Each carries eight string metadata fields, all of which the bot requires:
+
+| Field | Example |
+| --- | --- |
+| `chapter_number` | `III` |
+| `chapter_title` | `DUE DILIGENCE OBLIGATIONS FOR A TRANSPARENT AND SAFE ONLINE ENVIRONMENT` |
+| `section_number` | `1` |
+| `section_title` | `Provisions applicable to all providers of intermediary services` |
+| `article_number` | `11` |
+| `article_title` | `Points of contact for Member States’ authorities, the Commission and the Board` |
+| `clause_number` | `1` |
+| `description` | The clause text itself. |
+
+The preamble recitals are loaded too. They state what the articles are for, which is what makes a retrieved article intelligible to the model. A recital has no chapter or section of its own, so it is filed under `chapter_number` `0` with `article_number` set to the recital number and `article_title` to `Recital (N)`.
+
+Articles that sit directly under a chapter rather than inside a section get `section_number` `1` and an empty `section_title`.
 
 ## Running
 
@@ -68,9 +89,11 @@ set -a && . ./.env && set +a
 ./gradlew run
 ```
 
-The bot starts long-polling and logs each step to stdout. Message it on Telegram with a PDF to begin.
+The bot confirms the token, starts long-polling and logs each step to stdout. Message it on Telegram with a PDF to begin. `/reset` abandons a conversation and starts over.
 
 ## Costs
+
+Ingestion is cheap and happens once. Reports are not.
 
 A single document fans out to a lot of API calls: one feature-extraction call, then an embedding, a Pinecone query and a question-generation call per feature per regulation, then a summary call per regulation. A document with ten features means roughly forty OpenAI calls, several of which resend the whole PDF. Watch your usage on the first few runs.
 

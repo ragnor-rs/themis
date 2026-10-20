@@ -2,50 +2,26 @@ import com.github.kotlintelegrambot.Bot
 import com.github.kotlintelegrambot.bot
 import com.github.kotlintelegrambot.dispatch
 import com.github.kotlintelegrambot.dispatcher.document
+import com.github.kotlintelegrambot.dispatcher.telegramError
 import com.github.kotlintelegrambot.dispatcher.text
 import com.github.kotlintelegrambot.entities.ChatId
 import com.github.kotlintelegrambot.entities.Message
 import com.github.kotlintelegrambot.entities.TelegramFile
-import com.openai.client.okhttp.OpenAIOkHttpClient
+import com.github.kotlintelegrambot.logging.LogLevel
+import com.github.kotlintelegrambot.types.TelegramBotResult
 import com.openai.models.ChatModel
 import com.openai.models.chat.completions.*
 import com.openai.models.chat.completions.ChatCompletionContentPart.File.FileObject
-import com.openai.models.embeddings.EmbeddingCreateParams
-import com.openai.models.embeddings.EmbeddingModel
-import io.pinecone.clients.Pinecone
 import io.pinecone.unsigned_indices_model.ScoredVectorWithUnsignedIndices
 import org.intellij.markdown.flavours.commonmark.CommonMarkFlavourDescriptor
 import org.intellij.markdown.html.HtmlGenerator
 import org.intellij.markdown.parser.MarkdownParser
-import java.io.File
-import java.io.FileInputStream
-import java.io.IOException
-import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.system.exitProcess
-
-data class Clause(
-    val chapterNumber: String,
-    val chapterTitle: String,
-    val sectionNumber: String,
-    val sectionTitle: String,
-    val articleNumber: String,
-    val articleTitle: String,
-    val clauseNumber: String,
-    val description: String,
-)
 
 enum class UserStage {
     Initial,
     Questions,
-}
-
-enum class VectorDbIndex(
-    val indexName: String,
-    val description: String,
-) {
-    Dsa(requireEnv("PINECONE_INDEX_DSA_NAME"), "EU Digital Services Act"),
-    Gdpr(requireEnv("PINECONE_INDEX_GDPR_NAME"), "EU General Data Protection Regulation"),
 }
 
 data class Question(
@@ -86,39 +62,27 @@ data class UserState(
     }
 }
 
-val logDateFormatter = SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-
-fun log(s: String) {
-    println(logDateFormatter.format(Date()) + " - " + s)
-}
-
-val requiredEnvVars = listOf(
+private val requiredEnvVars = listOf(
     "TELEGRAM_BOT_TOKEN",
     "OPENAI_API_KEY",
     "PINECONE_API_KEY",
-    "PINECONE_INDEX_DSA_NAME",
-    "PINECONE_INDEX_GDPR_NAME",
-)
+) + VectorDbIndex.entries.map { it.indexNameEnvVar }
 
-fun requireEnv(name: String): String =
-    System.getenv(name) ?: error("Missing required environment variable: $name")
+/**
+ * Upper bound on the questions raised for one regulation.
+ *
+ * The questions are asked one at a time in a chat, so the ceiling is what a person will actually sit
+ * through, not what the clauses could justify asking.
+ */
+private const val MAX_QUESTIONS_PER_REGULATION = 10
 
-/** Reports every missing variable at once, so a misconfigured run does not need five restarts to fix. */
-private fun checkRequiredEnvVars() {
-    val missing = requiredEnvVars.filter { System.getenv(it).isNullOrBlank() }
-    if (missing.isEmpty()) {
-        return
-    }
-    System.err.println("Missing required environment variable(s): " + missing.joinToString(", "))
-    System.err.println("Copy .env.example to .env, fill it in, then: set -a && . ./.env && set +a")
-    System.err.println("See the Configuration section of README.md.")
-    exitProcess(1)
-}
+private const val WELCOME = "Send me a product requirements document as a PDF and I will check it against " +
+    "the EU Digital Services Act and the GDPR.\n\n" +
+    "I will ask you a few questions about what the document leaves out, then send back an HTML report.\n\n" +
+    "This is an experiment, not legal advice."
 
 fun main() {
-    checkRequiredEnvVars()
-
-    log("Bot started")
+    checkRequiredEnvVars(requiredEnvVars)
 
     val userStateMap = mutableMapOf<Long, UserState>()
 
@@ -127,6 +91,12 @@ fun main() {
     ) { UserState.createInitial() }
 
     fun summarize(message: Message, bot: Bot, state: UserState) {
+        // Writing the report is several more minutes of API calls, so say so rather than going quiet.
+        bot.sendMessage(
+            ChatId.fromId(message.chat.id),
+            text = "Thanks — writing the compliance report now. This takes a few minutes.",
+        )
+
         val summaryMap = mutableMapOf<VectorDbIndex, String>()
 
         VectorDbIndex.entries.forEachIndexed { i, index ->
@@ -173,33 +143,100 @@ fun main() {
         }
     }
 
+    /**
+     * Reports a failure to the user and resets the conversation.
+     *
+     * Without this the library swallows the exception, the chat stays stuck mid-questionnaire and
+     * nothing is written anywhere — the bot simply looks dead.
+     */
+    fun handleFailure(message: Message, bot: Bot, step: String, e: Throwable) {
+        log("Failed during $step for chat ${message.chat.id}: $e")
+        e.printStackTrace()
+        userStateMap.put(message.chat.id, UserState.createInitial())
+        runCatching {
+            bot.sendMessage(
+                ChatId.fromId(message.chat.id),
+                text = "Something went wrong while $step. The conversation has been reset — " +
+                    "send the PDF again to retry.",
+            )
+        }
+    }
+
     val bot = bot {
         token = requireEnv("TELEGRAM_BOT_TOKEN")
+        // Without this the dispatcher discards exceptions thrown in the handlers below without a trace.
+        logLevel = LogLevel.Error
         dispatch {
+            telegramError {
+                // Polling failures land here: an invalid or revoked token would otherwise leave the bot
+                // sitting silently in its loop, looking like it had started correctly.
+                log("Telegram error: ${error.getErrorMessage()}")
+            }
             text {
+                if (text.trim() == "/reset") {
+                    userStateMap.put(message.chat.id, UserState.createInitial())
+                    bot.sendMessage(ChatId.fromId(message.chat.id), text = "Starting over. Send me a PDF.")
+                    return@text
+                }
+
                 val state = getUserState(message)
 
                 if (state.stage == UserStage.Questions) {
-                    val nextState = state.addReply(message.text!!)
-                    userStateMap.put(message.chat.id, nextState)
+                    try {
+                        val nextState = state.addReply(text)
+                        userStateMap.put(message.chat.id, nextState)
 
-                    askNextQuestion(message, bot)
+                        askNextQuestion(message, bot)
+                    } catch (e: Throwable) {
+                        handleFailure(message, bot, "building your report", e)
+                    }
+                } else if (text.isNotBlank()) {
+                    // The conversation only starts with a document, so without this a first-time user
+                    // sending /start gets no reply at all.
+                    bot.sendMessage(ChatId.fromId(message.chat.id), text = WELCOME)
                 }
             }
             document {
                 val state = getUserState(message)
 
-                if (state.stage == UserStage.Initial) {
+                if (state.stage != UserStage.Initial) {
+                    bot.sendMessage(
+                        ChatId.fromId(message.chat.id),
+                        text = "I am still working through the questions for your previous document. " +
+                            "Answer those first, or send /reset to start over.",
+                    )
+                    return@document
+                }
+
+                if (media.mimeType != "application/pdf") {
+                    bot.sendMessage(
+                        ChatId.fromId(message.chat.id),
+                        text = "That is a ${media.mimeType ?: "file of unknown type"}. Please send a PDF.",
+                    )
+                    return@document
+                }
+
+                // Telegram does not guarantee a file name, and the OpenAI file part requires one.
+                val prdName = media.fileName ?: "document.pdf"
+
+                try {
+                    bot.sendMessage(
+                        ChatId.fromId(message.chat.id),
+                        text = "Reading your document. Finding the relevant clauses takes a few minutes — " +
+                            "I will come back with questions.",
+                    )
+
                     log("1) PRD doc - begin")
                     val prdFile = bot.downloadFileBytes(media.fileId)
-                    val prdBase64 = convertByteArrayToBase64(prdFile!!)
+                        ?: error("Telegram did not return the contents of $prdName")
+                    val prdBase64 = convertByteArrayToBase64(prdFile)
                     log("1) PRD doc - end")
 
                     log("2) product features - begin")
                     val output = promptWithPdfBase64(
                         prdBase64,
                         "Give a list of product features. Plain text. One level list.\nEach item must have a name and a detailed description.",
-                        media.fileName!!
+                        prdName
                     )
                     val items = toNonEmptyItems(output)
                     log("2) product features - end: extracted ${items.size} features")
@@ -208,7 +245,7 @@ fun main() {
                     val clauseMap = mutableMapOf<VectorDbIndex, List<Clause>>()
 
                     VectorDbIndex.entries.forEachIndexed { i, index ->
-                        val clauses = mutableListOf<Clause>()
+                        val regulationClauses = mutableListOf<Clause>()
                         items.forEachIndexed { j, productFeature ->
                             log("3.${i+1}.${j+1}.1) embeddings - begin")
                             val embeddings = generateEmbeddings(productFeature)
@@ -216,44 +253,87 @@ fun main() {
 
                             log("3.${i+1}.${j+1}.2) relevant clauses - begin")
                             val results = queryVectorDb(embeddings, index.indexName)
-                            for (result in results) {
-                                result.metadata.let {
-                                    val clause = Clause(
-                                        it.getFieldsOrThrow("chapter_number").stringValue,
-                                        it.getFieldsOrThrow("chapter_title").stringValue,
-                                        it.getFieldsOrThrow("section_number").stringValue,
-                                        it.getFieldsOrThrow("section_title").stringValue,
-                                        it.getFieldsOrThrow("article_number").stringValue,
-                                        it.getFieldsOrThrow("article_title").stringValue,
-                                        it.getFieldsOrThrow("clause_number").stringValue,
-                                        it.getFieldsOrThrow("description").stringValue,
-                                    )
-                                    clauses.add(clause)
-                                }
-                            }
-                            log("3.${i+1}.${j+1}.2) relevant clauses - end: fetched ${results.size} clauses")
-
-                            log("3.${i+1}.${j+1}.3) question gen - begin")
-                            val indexQuestions = generateQuestions(prdBase64, clauses, media.fileName!!, index).map { Question(it, index) }
-                            questions.addAll(indexQuestions)
-                            log("3.${i+1}.${j+1}.3) question gen - end: generated ${indexQuestions.size} questions")
+                            val featureClauses = results.map { it.toClause() }
+                            regulationClauses.addAll(featureClauses)
+                            log("3.${i+1}.${j+1}.2) relevant clauses - end: fetched ${featureClauses.size} clauses")
                         }
-                        clauseMap.put(index, clauses)
+
+                        // Features overlap heavily, so the same clause comes back for several of them.
+                        val distinctClauses = regulationClauses.distinct()
+                        log(
+                            "3.${i+1}) ${index.description}: ${distinctClauses.size} distinct clauses " +
+                                "from ${regulationClauses.size} matches"
+                        )
+                        clauseMap.put(index, distinctClauses)
+
+                        // Once per regulation over the whole deduplicated clause set, rather than once per
+                        // feature. Per feature, each call re-asked what the others had already covered —
+                        // thirteen features produced hundreds of near-identical questions, far more than
+                        // anyone can answer in a chat, and the filter below could not thin them out.
+                        log("3.${i+1}.q) question gen - begin")
+                        val indexQuestions = generateQuestions(prdBase64, distinctClauses, prdName, index)
+                            .map { Question(it, index) }
+                        questions.addAll(indexQuestions)
+                        log("3.${i+1}.q) question gen - end: generated ${indexQuestions.size} questions")
+                    }
+
+                    // Cheap pass before spending a call on the filter: the two regulations overlap on
+                    // consent and transparency, so they independently ask for the same thing verbatim.
+                    val uniqueQuestions = questions.distinctBy { it.question.trim().lowercase() }
+                    if (uniqueQuestions.size < questions.size) {
+                        log("4) dedupe questions: dropped ${questions.size - uniqueQuestions.size} repeats")
                     }
 
                     log("4) filter questions - begin")
-                    val filteredQuestions = filterQuestions(prdBase64, questions, media.fileName!!)
-                    log("4) filter questions - end: removed ${questions.size - filteredQuestions.size} questions")
+                    val filteredQuestions = filterQuestions(prdBase64, uniqueQuestions, prdName)
+                    log("4) filter questions - end: ${filteredQuestions.size} of ${uniqueQuestions.size} questions kept")
 
-                    userStateMap.put(message.chat.id, state.switchToQuestions(filteredQuestions, prdBase64, clauseMap, media.fileName!!))
+                    userStateMap.put(message.chat.id, state.switchToQuestions(filteredQuestions, prdBase64, clauseMap, prdName))
+
+                    if (filteredQuestions.isEmpty()) {
+                        bot.sendMessage(
+                            ChatId.fromId(message.chat.id),
+                            text = "The document already answers everything I would have asked. " +
+                                "Writing the report now.",
+                        )
+                    } else {
+                        bot.sendMessage(
+                            ChatId.fromId(message.chat.id),
+                            text = "I have ${filteredQuestions.size} question(s) for you.",
+                        )
+                    }
 
                     askNextQuestion(message, bot)
+                } catch (e: Throwable) {
+                    handleFailure(message, bot, "reading your document", e)
                 }
             }
         }
     }
 
+    // Confirm the token before polling. getUpdates failures are reported asynchronously, so a bad token
+    // otherwise shows up as nothing at all: the bot logs that it started and then waits forever.
+    bot.getMe().fold(
+        ifSuccess = { log("Connected to Telegram as @${it.username}") },
+        ifError = {
+            System.err.println("Telegram rejected the bot token: ${it.describe()}")
+            System.err.println("Check TELEGRAM_BOT_TOKEN against the token @BotFather gave you.")
+            exitProcess(1)
+        },
+    )
+
+    Runtime.getRuntime().addShutdownHook(Thread { closeIndexConnections() })
+
+    log("Listening for documents")
     bot.startPolling()
+}
+
+/** Flattens the error variants into one line, so a failed call can be logged without a `when` at each site. */
+private fun TelegramBotResult.Error.describe(): String = when (this) {
+    is TelegramBotResult.Error.HttpError -> "HTTP $httpCode $description"
+    is TelegramBotResult.Error.TelegramApi -> "Telegram API error $errorCode: $description"
+    is TelegramBotResult.Error.InvalidResponse -> "invalid response: $httpCode $httpStatusMessage"
+    is TelegramBotResult.Error.Unknown -> "unexpected failure: ${exception.message}"
 }
 
 fun generateQuestions(
@@ -279,24 +359,44 @@ private fun buildGenerateQuestionsPrompt(
     val promptBuilder = StringBuilder()
 
     promptBuilder.appendLine("Generate questions to gather data missing from the provided product specification. Questions will be used to assess compliance with the clauses below. Always mention the name of law along with an article number. Plain text. One level list. Don't use bullets. Don't start with question index. One question per line.")
+    // Unbounded, this produced a question per clause, which is more than anyone will answer in a chat.
+    promptBuilder.appendLine("Ask at most $MAX_QUESTIONS_PER_REGULATION questions: the ones whose answers matter most for assessing compliance. Merge questions that would be answered by the same piece of information, and never ask the same thing twice.")
 
-    if (clauses.isNotEmpty()) {
-        promptBuilder.appendLine()
-        promptBuilder.appendLine()
-        promptBuilder.appendLine("--- Start of relevant clauses ---")
-        for (clause in clauses) {
-            promptBuilder.appendLine("From ${index.description}")
-            promptBuilder.appendLine("Chapter ${clause.chapterNumber}. ${clause.chapterTitle}")
-            promptBuilder.appendLine("Section ${clause.sectionNumber}. ${clause.sectionTitle}")
-            promptBuilder.appendLine("Article ${clause.articleNumber}. ${clause.articleTitle}")
-            promptBuilder.appendLine(clause.description)
-            promptBuilder.appendLine()
-        }
-        promptBuilder.appendLine("--- End of relevant clauses ---")
-    }
+    promptBuilder.appendClauses(clauses, index)
 
     val prompt = promptBuilder.toString()
     return prompt
+}
+
+/**
+ * Renders the retrieved clauses as the citation context for a prompt.
+ *
+ * Headings with no title are left out: recitals carry no chapter or section, and a good number of
+ * articles sit outside any section, so printing the lines unconditionally produced "Chapter 0." and
+ * "Section 1." with nothing after them.
+ */
+private fun StringBuilder.appendClauses(clauses: List<Clause>, index: VectorDbIndex) {
+    if (clauses.isEmpty()) {
+        return
+    }
+
+    appendLine()
+    appendLine()
+    appendLine("--- Start of relevant clauses ---")
+    for (clause in clauses) {
+        appendLine("From ${index.description}")
+        if (clause.chapterTitle.isNotBlank()) {
+            appendLine("Chapter ${clause.chapterNumber}. ${clause.chapterTitle}")
+        }
+        if (clause.sectionTitle.isNotBlank()) {
+            appendLine("Section ${clause.sectionNumber}. ${clause.sectionTitle}")
+        }
+        appendLine("Article ${clause.articleNumber}. ${clause.articleTitle}")
+        appendLine("Clause ${clause.clauseNumber}")
+        appendLine(clause.description)
+        appendLine()
+    }
+    appendLine("--- End of relevant clauses ---")
 }
 
 fun filterQuestions(
@@ -343,20 +443,7 @@ private fun buildGenerateSummaryPrompt(
 
     promptBuilder.appendLine("This is a product requirements description file. Evaluate if it meets legal requirements specified by the list of relevant clauses below.")
 
-    if (clauses.isNotEmpty()) {
-        promptBuilder.appendLine()
-        promptBuilder.appendLine()
-        promptBuilder.appendLine("--- Start of relevant clauses ---")
-        for (clause in clauses) {
-            promptBuilder.appendLine("From ${index.description}")
-            promptBuilder.appendLine("Chapter ${clause.chapterNumber}. ${clause.chapterTitle}")
-            promptBuilder.appendLine("Section ${clause.sectionNumber}. ${clause.sectionTitle}")
-            promptBuilder.appendLine("Article ${clause.articleNumber}. ${clause.articleTitle}")
-            promptBuilder.appendLine(clause.description)
-            promptBuilder.appendLine()
-        }
-        promptBuilder.appendLine("--- End of relevant clauses ---")
-    }
+    promptBuilder.appendClauses(clauses, index)
 
     if (indexReplies.isNotEmpty()) {
         promptBuilder.appendLine()
@@ -394,34 +481,6 @@ private fun buildJoinSummariesPrompt(summaryMap: MutableMap<VectorDbIndex, Strin
     return prompt
 }
 
-// Lazy so that checkRequiredEnvVars() reports a missing OPENAI_API_KEY before the SDK does.
-val client by lazy { OpenAIOkHttpClient.fromEnv() }
-
-/**
- * Converts a file to Base64 string
- * @param filePath Path to the file to convert
- * @return Base64 encoded string representation of the file
- * @throws IOException if file cannot be read
- */
-@Throws(IOException::class)
-fun convertFileToBase64(filePath: String): String? {
-    val file = File(filePath)
-
-    // Check if file exists
-    if (!file.exists()) {
-        throw IOException("File not found: $filePath")
-    }
-
-    // Read file bytes
-    val fileBytes = ByteArray(file.length().toInt())
-    FileInputStream(file).use { fis ->
-        fis.read(fileBytes)
-    }
-
-    // Convert to Base64
-    return convertByteArrayToBase64(fileBytes)
-}
-
 private fun convertByteArrayToBase64(fileBytes: ByteArray): String = Base64.getEncoder().encodeToString(fileBytes)
 
 fun promptWithPdfBase64(base64Content: String?, prompt: String, filename: String?): String {
@@ -450,7 +509,7 @@ fun promptWithPdfBase64(base64Content: String?, prompt: String, filename: String
         .messages(listOf(userMessage))
         .build()
 
-    val completion = client.chat().completions().create(params)
+    val completion = openAi.chat().completions().create(params)
     return completion.choices()[0].message().content().orElse("")
 }
 
@@ -458,18 +517,7 @@ fun toNonEmptyItems(text: String): List<String> {
     return text.split("\n").map { it -> it.trim() }.filter { it -> it.isNotEmpty() }
 }
 
-fun generateEmbeddings(text: String): List<Float> {
-    val createParams = EmbeddingCreateParams.builder()
-        .input(text)
-        .model(EmbeddingModel.Companion.TEXT_EMBEDDING_3_LARGE)
-        .build()
-
-    return client.embeddings().create(createParams).data()[0].embedding()
-}
-
 fun queryVectorDb(embeddings: List<Float>, indexName: String): List<ScoredVectorWithUnsignedIndices> {
-    val pinecone = Pinecone.Builder(requireEnv("PINECONE_API_KEY")).build()
-    val index = pinecone.getIndexConnection(indexName)
-    val response = index.queryByVector(5, embeddings, true, true)
+    val response = indexConnection(indexName).queryByVector(5, embeddings, true, true)
     return response.matchesList
 }
